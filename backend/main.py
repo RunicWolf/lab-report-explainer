@@ -3,18 +3,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
 import fitz  # PyMuPDF
+import json
 from openai import OpenAI
-
+import uuid
+from typing import Dict
+from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# openai.api_key = os.getenv("OPENAI_API_KEY")
-
 app = FastAPI()
 
-# Allow frontend requests (CORS setup)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +23,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Basic check routes
+# In-memory session storage
+session_history: Dict[str, list] = {}
+session_mode: Dict[str, str] = {}
+
 @app.get("/")
 def read_root():
     return {"message": "Lab Report Explainer backend running"}
@@ -35,9 +38,12 @@ def config_check():
         "db_url_exists": bool(os.getenv("DATABASE_URL")),
     }
 
-# Main functionality route
-@app.post("/generate-explanation/")
-async def generate_explanation(file: UploadFile = File(None), text: str = Form(None)):
+@app.get("/debug-key/")
+def debug_key():
+    return {"openai_key_loaded": bool(os.getenv("OPENAI_API_KEY"))}
+
+@app.post("/start-session/")
+async def start_session(file: UploadFile = File(None), text: str = Form(None)):
     extracted_text = ""
 
     if file:
@@ -53,26 +59,76 @@ async def generate_explanation(file: UploadFile = File(None), text: str = Form(N
     if not extracted_text.strip():
         return {"error": "Uploaded file or text is empty."}
 
-    try:
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    session_id = str(uuid.uuid4())
+    session_mode[session_id] = "structured"
 
-        response = client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful medical assistant."},
-            {"role": "user", "content": f"Please explain this lab report in simple terms:\n{extracted_text}"}
-        ],
+    system_message = {
+        "role": "system",
+        "content": (
+            "You are a medical assistant. Given raw lab report text, respond strictly in JSON format like this:\n"
+            "{\n"
+            "  \"diagnosis\": \"...\",\n"
+            "  \"suggested_action\": \"...\",\n"
+            "  \"notes\": \"...\"\n"
+            "}\n"
+            "Do not include any extra text or formatting outside this JSON object."
+        )
+    }
+
+    session_history[session_id] = [system_message, {"role": "user", "content": extracted_text}]
+
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=session_history[session_id],
         max_tokens=1000
     )
 
-        explanation = response.choices[0].message.content
+    content = response.choices[0].message.content.strip()
 
-        return {"explanation": explanation}
+    try:
+        structured_output = json.loads(content)
+    except json.JSONDecodeError:
+        structured_output = {"error": "AI response was not valid JSON.", "raw_response": content}
 
-    except Exception as e:
-        return {"error": str(e)}
-    
-@app.get("/debug-key/")
-def debug_key():
-    return {"openai_key_loaded": bool(os.getenv("OPENAI_API_KEY"))}
+    session_history[session_id].append({"role": "assistant", "content": content})
 
+    return {"session_id": session_id, **structured_output}
+
+class ChatInput(BaseModel):
+    session_id: str
+    user_message: str
+
+@app.post("/chat/")
+async def continue_chat(data: ChatInput):
+    if data.session_id not in session_history:
+        return {"error": "Invalid session ID."}
+
+    if session_mode.get(data.session_id) == "structured":
+        session_mode[data.session_id] = "chat"
+
+        recent_history = session_history[data.session_id][-2:]
+        refined_system_message = {
+            "role": "system",
+            "content": (
+                "You are a medical assistant chatbot. Your job is to assist the user with questions related to their lab report. "
+                "You can answer questions about possible causes, risks, lifestyle recommendations (such as diet, exercise, sports activity), "
+                "and treatment options related to the reported condition. If the user asks unrelated questions (about entertainment, history, etc.), "
+                "respond: 'I can only assist with healthcare-related questions.' Speak in natural language unless specifically requested to use JSON."
+            )
+        }
+
+        session_history[data.session_id] = [refined_system_message] + recent_history
+
+    session_history[data.session_id].append({"role": "user", "content": data.user_message})
+
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=session_history[data.session_id],
+        max_tokens=1000
+    )
+
+    content = response.choices[0].message.content.strip()
+
+    session_history[data.session_id].append({"role": "assistant", "content": content})
+
+    return {"response": content}
