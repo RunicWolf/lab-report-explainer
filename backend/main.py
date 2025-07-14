@@ -9,6 +9,10 @@ import uuid
 from typing import Dict, List
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from typing import Optional
+from backend.database import SessionLocal
+
+
 
 # Import database and models
 from backend.database import SessionLocal
@@ -146,10 +150,18 @@ async def continue_chat(data: ChatInput):
     session_history[data.session_id].append({"role": "assistant", "content": content})
     return {"response": content}
 
-@app.get("/doctors/", response_model=List[DoctorOut])
-def get_doctors(location: str = Query(...), specialty: str = Query(...), db: Session = Depends(get_db)):
-    doctors = db.query(Doctor).filter(
-        Doctor.location.ilike(f"%{location}%"),
-        Doctor.specialty.ilike(f"%{specialty}%")
-    ).all()
+@app.get("/doctors/")
+def get_doctors(specialty: Optional[str] = None, location: Optional[str] = None):
+    db = SessionLocal()  # ✅ Make sure this line exists
+
+    query = db.query(Doctor)
+    if specialty:
+        query = query.filter(Doctor.specialty == specialty)
+    if location:
+        query = query.filter(Doctor.location == location)
+
+    doctors = query.all()
+    db.close()  # ✅ Always close the session
+
     return doctors
+
